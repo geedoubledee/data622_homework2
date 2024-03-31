@@ -1,0 +1,413 @@
+---
+title: "DATA 622 - Homework 2"
+author: "Glen Dale Davis"
+date: "2024-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+
+```{r packages, warning = FALSE, message = FALSE}
+library(caret)
+library(DataExplorer)
+library(ggcorrplot)
+library(knitr)
+library(MASS)
+select <- dplyr::select
+library(tidyverse)
+library(RColorBrewer)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(psych)
+
+```
+
+## Introduction
+
+We load [a dataset of Web sites](https://www.kaggle.com/datasets/danielfernandon/web-page-phishing-dataset) labeled either `Phishing` or `Legitimate`. Below are the first 10 observations in the dataset, and for the sake of readability, only the first 12 columns are displayed.
+
+```{r data}
+cur_theme <- theme_set(theme_classic())
+my_url <- "https://raw.githubusercontent.com/geedoubledee/data622_homework2/main/web-page-phishing.csv"
+phishing_df <- read.csv(my_url, skip = 1)
+rem <- c("phishing", "n_hastag", "n_hypens")
+phishing_df <- phishing_df |>
+    mutate(LABEL = factor(phishing, labels = c("Legitimate", "Phishing")),
+           n_hashtag = n_hastag,
+           n_hyphens = n_hypens) |>
+    relocate(LABEL, .before = url_length) |>
+    relocate(n_hashtag, .before = n_dollar) |>
+    select(-all_of(rem))
+kable(phishing_df[1:10, 1:12], format = "simple")
+
+```
+
+The first column is the response variable that we will attempt to predict: a binary factor named `LABEL`. In addition to the response variable, there are 19 integer predictor variables:
+
+```{r variable_classes}
+classes <- as.data.frame(unlist(lapply(phishing_df, class))) |>
+    rownames_to_column()
+cols <- c("Variable", "Class")
+colnames(classes) <- cols
+classes_summary <- classes |>
+    group_by(Class) |>
+    summarize(Count = n(),
+              Variables = paste(sort(unique(Variable)),collapse=", ")) |>
+    filter(Class == "integer")
+kable(classes_summary, format = "simple")
+
+```
+
+All of these predictor variables except for `url_length` and `n_redirection` represent counts of specific punctuation characters within the Web sites' urls. The former is the count of all characters within the url, and the latter is the count of redirects within the url. 
+
+## Exploratory Data Analysis
+
+We check for any missing values within the dataset. 
+
+```{r completeness}
+rem <- c("discrete_columns", "continuous_columns",
+            "total_observations", "memory_usage")
+completeness <- introduce(phishing_df) |>
+    select(-all_of(rem))
+knitr::kable(t(completeness), format = "simple")
+
+```
+
+Of the 100,000+ observations, none contain missing values we need to address for any of the variables.
+
+We check the distribution of the response variable to see if there's a class imbalance between `Phishing` Web sites and `Legitimate` Web sites.
+
+```{r response_dist, warning = FALSE, message = FALSE}
+pal <- brewer.pal(n = 12, name = "Paired")
+cols <- pal[c(2, 8)]
+names(cols) <- c("Legitimate", "Phishing")
+obs = nrow(phishing_df)
+p1 <- phishing_df |>
+    ggplot(aes(x = LABEL)) +
+    geom_histogram(aes(color = LABEL, fill = LABEL), stat = "count") +
+    geom_text(stat = "count", aes(label = paste0(round(
+        after_stat(count) / obs * 100, 1), "%")),
+              size = 5, color = "white", vjust = 2, fontface = "bold") + 
+    scale_color_manual(values = cols) +
+    scale_fill_manual(values = cols) +
+    scale_y_continuous(labels = scales::comma) +
+    labs(title = "Distribution of Phishing & Legitimate Web sites",
+         y = "COUNT") +
+    theme(legend.position = "none")
+p1
+
+```
+
+The ratio of `Legitimate` to `Phishing` Web sites is not quite 2:1, so the classes are only marginally imbalanced here, and no oversampling corrections will be required later.
+
+We summarize the distributions of the predictor variables. 
+
+```{r describe}
+rem <- c("vars", "n", "trimmed", "mad", "skew", "kurtosis", "se")
+excl <- c("LABEL*")
+describe <- describe(phishing_df) |>
+    select(-all_of(rem))
+describe <- describe |>
+    filter(!rownames(describe) %in% excl)
+knitr::kable(describe, format = "simple")
+
+```
+
+The median for many of these predictor variables is 0, which suggests their distributions are degenerate. One predictor, `n_redirection`,  also seems to have a nonsensical range that includes -1. We update the value for these observations to be `NA`. When we build decision tree models later, they won't have any issues handling these missing values. However, we will replace the `NA` values with their original values for the random forest model we build. This is because random forest models can't handle missing values unless they've been imputed, and we favor the original values over imputation here. 
+
+```{r n_redirection}
+phishing_df <- phishing_df |>
+    mutate(n_redirection = ifelse(n_redirection == -1, NA, n_redirection))
+
+```
+
+We check for any near-zero variance predictors to confirm the degenerate distributions we suspect.
+
+```{r near-zero_variance}
+nzv <- nearZeroVar(phishing_df, names = TRUE, saveMetrics = FALSE)
+nzv
+
+```
+
+Out of 19 predictors, 14 of them demonstrate near-zero variance and would only serve as noise in our models, so we remove them.
+
+```{r n_misc}
+phishing_df <- phishing_df |>
+    select(-all_of(nzv))
+
+```
+
+We take a look at the distributions of the remaining predictor variables.
+
+```{r predictors_dist, warning = FALSE, message = FALSE}
+skip <- c("LABEL")
+phishing_piv <- phishing_df |>
+    pivot_longer(cols = !all_of(skip), names_to = "PREDICTOR",
+                 values_to = "VALUE")
+p2 <- phishing_piv |>
+    ggplot(aes(x = VALUE, color = LABEL, fill = LABEL)) +
+    geom_histogram(data = subset(phishing_piv, LABEL == "Legitimate"),
+                   alpha = 0.5) +
+    geom_histogram(data = subset(phishing_piv, LABEL == "Phishing"),
+                   alpha = 0.5) +
+    scale_color_manual(values = cols) +
+    scale_fill_manual(values = cols) +
+    scale_y_continuous(labels = scales::comma) +
+    facet_wrap(PREDICTOR ~ ., ncol = 2, scales = "free_x") +
+    labs(title = "Distribution of Remaining Predictor Variables",
+         y = "COUNT") +
+    theme(legend.position = "top")
+p2
+
+```
+
+The distributions for the remaining predictor variables are all right-skewed. We considered whether shifting and transforming the data might improve the performance of the models we will be building later, but decision tree models seem to be insensitive to the scale of predictors. Transformed data didn't result in the creation of different decision boundaries, so we decided against it.
+
+We visualize correlations between the response variable and the remaining predictors, as well as any predictor-predictor correlations. In the interest of ignoring clutter, only correlations greater than 0.1 (in absolute value) are displayed.
+
+```{r correlations}
+plot_corr_range <- function(df, mn=0.1, mx=1.0, excl=c(NA)){
+    palette <- brewer.pal(n = 7, name = "RdBu")[c(1, 4, 7)]
+    tit = sprintf("Correlations Between %s and %s (Absolute Value)", mn, mx)
+    r <- model.matrix(~0+., data = df) |>
+        cor() |>
+        round(digits=2)
+    is.na(r) <- abs(r) > mx
+    is.na(r) <- abs(r) < mn
+    if (!is.na(excl)){
+        r <- as.data.frame(r) |>
+            select(-all_of(excl)) |>
+            filter(!rownames(r) %in% excl)
+    }
+    p <- r |>
+        ggcorrplot(show.diag = FALSE, type = "lower", lab = TRUE,
+                   lab_size = 3, tl.cex = 10, tl.srt = 90,
+                   colors = palette, outline.color = "white") +
+        labs(title = tit) +
+        theme(plot.title.position = "plot")
+    p
+}
+excl <- c("LABELLegitimate")
+p3 <- plot_corr_range(df = phishing_df, excl = excl)
+p3
+
+```
+
+We see that `n_slash` is strongly positively correlated with `Phishing` Web sites, and `url_length` is moderately positively correlated with `Phishing` Web sites. So the more slashes a url contains, and the longer the url is, the more likely it is that the url belongs to a `Phishing` Web site. No other predictor variables have as strong of a correlation with the response variable as either of these.
+
+We also see that `url_length` is pretty correlated with most other predictors, including `n_slash`. Correlated predictors don't negatively impact the predictive power of decision tree models much though.
+
+## Data Preparation
+
+We split the data into train and test sets. 
+
+```{r train_test_split}
+set.seed(816)
+sample <- sample(nrow(phishing_df),
+                 round(nrow(phishing_df) * 0.7),
+                 replace = FALSE)
+train_df <- phishing_df[sample, ]
+test_df <- phishing_df[-sample, ]
+
+```
+
+We confirm the class distributions are similar in the original, train, and test sets.
+
+```{r class_dist_check_orig_train_test}
+dist1 <- as.data.frame(round(prop.table(table(select(phishing_df, LABEL))), 2))
+colnames(dist1) <- c("LABEL", "Original Freq")
+dist2 <- as.data.frame(round(prop.table(table(select(train_df, LABEL))), 2))
+colnames(dist2) <- c("LABEL", "Train Freq")
+dist3 <- as.data.frame(round(prop.table(table(select(test_df, LABEL))), 2))
+colnames(dist3) <- c("LABEL", "Test Freq")
+class_dist <- dist1 |>
+    left_join(dist2, by = join_by(LABEL)) |>
+    left_join(dist3, by = join_by(LABEL))
+kable(class_dist, format = "simple")
+
+```
+
+The class distributions are all very similar.
+
+## Model Building
+
+Now we are ready to build our decision tree models. We'll exclude `url_length` from the first model, and we'll exclude `n_slash` from the second model. These predictors have the highest correlations with the response variable, but they are also pretty correlated with each other, so a decision tree trained on both features might not be able to use the information from both of them anyway. With two correlated predictors, whatever feature is not used for an early split isn't typically going to be very useful in creating a later split because it just reinforces what we already know. So the second correlated predictor would probably be ignored in favor of a different, more illuminating feature.
+
+### Decision Tree Model 1:
+
+```{r decision_tree1}
+dtree_mod1 <- rpart(LABEL ~ . - url_length, method = "class", data = train_df)
+rpart.plot(dtree_mod1, box.palette = "BuOr")
+
+```
+
+Decision Tree Model 1 includes a root node and two decision nodes using two variables, `n_slash` and `n_hyphens`, resulting in four leaf nodes. 
+
+```{r dtree1_var_imp}
+dtree1Imp <- varImp(dtree_mod1)
+dtree1Imp <- dtree1Imp |>
+    rownames_to_column()
+cols <- c("Predictor", "Importance")
+colnames(dtree1Imp) <- cols
+dtree1Imp <- dtree1Imp |>
+    arrange(desc(Importance))
+kable(dtree1Imp, format = "simple")
+
+```
+
+The feature importance estimates for Decision Tree Model 1 are in line with our expectations, with `n_slash` and `n_hyphens` having scored highest.
+
+### Decision Tree Model 2:
+
+```{r decision_tree2}
+dtree_mod2 <- rpart(LABEL ~ . - n_slash, method = "class", data = train_df)
+rpart.plot(dtree_mod2, box.palette = "BuOr")
+
+```
+
+Decision Tree Model 2 also uses only two variables, `url_length` and `n_dots`, and has the same assortment of nodes as Decision Tree Model 1.
+
+```{r dtree2_var_imp}
+dtree2Imp <- varImp(dtree_mod2)
+dtree2Imp <- dtree2Imp |>
+    rownames_to_column()
+cols <- c("Predictor", "Importance")
+colnames(dtree2Imp) <- cols
+dtree2Imp <- dtree2Imp |>
+    arrange(desc(Importance))
+kable(dtree2Imp, format = "simple")
+
+```
+
+Looking at the feature importance estimates for Decision Tree Model 2, `n_dots` scored lower than `n_hyphens`, so at first glance it's surprising `n_hyphens` was not included in any splits. However, this just means that `n_hyphens` was a close competitor for the best variable to split on sometimes. We don't see it in the splits for Decision Tree Model 2 because it just never won.
+
+Now we build our random forest model. Since this type of model can't handle missing values, we revert the `NA` values we introduced for `n_redirection` to the original values of -1. We set the number of candidate features for each tree to two.
+
+### Random Forest Model:
+
+```{r rf1}
+train_df_alt <- train_df |>
+    mutate(n_redirection = ifelse(is.na(n_redirection), -1, n_redirection))
+test_df_alt <- test_df |>
+    mutate(n_redirection = ifelse(is.na(n_redirection), -1, n_redirection))
+rf_mod <- train(LABEL ~ ., data = train_df_alt, metric = "Accuracy",
+                method = "rf", trControl = trainControl(method = "none"),
+                tuneGrid = expand.grid(.mtry = 2))
+rfImp <- varImp(rf_mod, scale = TRUE)
+rfImp <- rfImp$importance |>
+    rownames_to_column()
+cols <- c("Predictor", "Importance")
+colnames(rfImp) <- cols
+rfImp <- rfImp |>
+    arrange(desc(Importance))
+kable(rfImp, format = "simple")
+
+```
+
+Unsurprisingly, the random forest model estimates `url_length` and `n_slash` to be the two most important features for predicting the response variable. The relative importance estimate for `n_redirection` is 0, indicating it was not used in any of the trees. 
+
+## Model Evaluation
+
+We make predictions on the test data using all three models, and we construct confusion matrices and calculate a variety of performance metrics for them. 
+
+First, we look at the confusion matrices for each of the models.
+
+```{r cm_plot}
+#Decision Tree Model 1: predictions/confusion matrix
+pred_dtree_mod1 <- predict(dtree_mod1, test_df, type = "class")
+dt1cm_complete <- confusionMatrix(pred_dtree_mod1, test_df$LABEL,
+                                  positive = "Phishing")
+dt1cm <- as.data.frame(dt1cm_complete$table)
+dt1cm$Reference <- factor(dt1cm$Reference, levels = rev(levels(dt1cm$Reference)))
+dt1cm <- dt1cm |>
+    mutate(
+        Label = case_when(
+            Prediction == "Legitimate" & Reference == "Legitimate" ~ "TN",
+            Prediction == "Phishing" & Reference == "Phishing" ~ "TP",
+            Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
+            Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
+        Model = "Decision Tree Model 1")
+#Decision Tree Model 2: predictions/confusion matrix
+pred_dtree_mod2 <- predict(dtree_mod2, test_df, type = "class")
+dt2cm_complete <- confusionMatrix(pred_dtree_mod2, test_df$LABEL,
+                                  positive = "Phishing")
+dt2cm <- as.data.frame(dt2cm_complete$table)
+dt2cm$Reference <- factor(dt2cm$Reference, levels = rev(levels(dt2cm$Reference)))
+dt2cm <- dt2cm |>
+    mutate(
+        Label = case_when(
+            Prediction == "Legitimate" & Reference == "Legitimate" ~ "TN",
+            Prediction == "Phishing" & Reference == "Phishing" ~ "TP",
+            Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
+            Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
+        Model = "Decision Tree Model 2")
+#Random Forest Model: predictions/confusion matrix
+pred_rf_mod <- predict(rf_mod, test_df_alt)
+rfcm_complete <- confusionMatrix(pred_rf_mod, test_df_alt$LABEL,
+                                 positive = "Phishing")
+rfcm <- as.data.frame(rfcm_complete$table)
+rfcm$Reference <- factor(rfcm$Reference, levels = rev(levels(rfcm$Reference)))
+rfcm <- rfcm |>
+    mutate(
+        Label = case_when(
+            Prediction == "Legitimate" & Reference == "Legitimate" ~ "TN",
+            Prediction == "Phishing" & Reference == "Phishing" ~ "TP",
+            Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
+            Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
+        Model = "Random Forest Model")
+cm <- bind_rows(dt1cm, dt2cm, rfcm)
+p4 <- cm |>
+    ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(col = "black") +
+    geom_text(aes(label = Freq)) +
+    geom_text(aes(label = Label), vjust = 3) + 
+    scale_fill_gradient(low = "white", high = pal[4]) +
+    scale_x_discrete(position = "top") +
+    facet_wrap(Model ~ ., ncol = 3, strip.position = "bottom") +
+    labs(title = "Confusion Matrices for All Models") +
+    theme(axis.line.x = element_blank(),
+          axis.line.y = element_blank(),
+          axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.ticks = element_blank(),
+          legend.position = "bottom",
+          strip.placement = "outside")
+p4
+
+```
+
+We immediately note some differences between the models. Decision Tree Model 1 has fewer false positives than false negatives, whereas the opposite is true for Decision Tree Model 2. The Random Forest Model, in contrast, has a very balanced ratio of false positives to false negatives. 
+
+Next, we look at various performance measures. 
+
+```{r performance_metrics}
+metrics <- as.data.frame(cbind(rbind(dt1cm_complete$byClass,
+                                     dt2cm_complete$byClass,
+                                     rfcm_complete$byClass),
+                               rbind(dt1cm_complete$overall,
+                                     dt2cm_complete$overall,
+                                     rfcm_complete$overall)))
+rownames(metrics) <- c("Decision Tree Model 1",
+                       "Decision Tree Model 2",
+                       "Random Forest Model")
+keep <- c("Accuracy", "Kappa", "Precision", "Recall", "F1", "Specificity")
+metrics <- metrics |>
+    select(all_of(keep)) |>
+    round(3)
+kable(metrics, format = "simple")
+
+```
+
+Confirming what we assessed visually, Decision Tree Model 1 has the worst recall, whereas Decision Tree Model 2 has the worst precision. But both decision tree models are similarly accurate overall. The Random Forest Model is more accurate than either of them though, and it balances precision and recall well, giving it the highest F1 score. 
+
+## Conclusion
+
+Because our dataset included two good predictors of `Phishing` Web sites that were pretty correlated with one another, the decision tree model we created using only one of those predictors was almost as accurate as the decision tree model we created using only the other of those predictors. However, each model suffered more from one kind of classification error than the other. If we were concerned about limiting the number of irrelevant `Phishing` alerts, Decision Tree Model 1 outperforms Decision Tree Model 2 because relatively few of the positive alerts it generates are false positives. However, if we were concerned about capturing most of the Web sites that are actually `Phishing` Web sites in our alerts, Decision Tree Model 2 outperforms Decision Tree Model 1 because it classifies relatively few `Phishing` Web sites as `Legitimate` Web sites.
+
+If we had to choose between the decision tree models only, there is a clear trade-off in how the models perform, and our choice would need to be informed by the business's needs. In many instances, our preference would probably be for Decision Tree Model 2. It is the safer of the two, in that deploying it would prevent employees from being exposed to more `Phishing` Web sites. Although it might annoy employees because a lot of `Legitimate` Web sites would be blocked as well, it's easier to over-censor at first and slowly add Web sites to a "cleared" list than it is to under-censor at first and incur more harm. 
+
+By aggregating a variety of decision trees using any two of the predictors, the Random Forest Model overcomes some of the limitations of the individual decision tree models. The increased accuracy and balance between precision and recall we saw make it an excellent `Phishing` Web site classifier. What's even more impressive is that the random forest model could probably have identified the important predictors and generated pretty good predictions with this dataset even if we hadn't done all the exploratory data analysis we did and trimmed the feature space ourselves. While we should always do the work of getting rid of any noise we can identify, random forest models just aren't as sensitive to it as some other models. They can weed out unimportant features on their own, as evidenced by `n_redirection` being given a feature importance estimate of 0 in our Random Forest Model.

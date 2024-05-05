@@ -377,6 +377,7 @@ p4 <- cm |>
           legend.position = "bottom",
           strip.placement = "outside")
 p4
+ggsave("data622_hw2_p4.png", p4)
 
 ```
 
@@ -399,6 +400,7 @@ metrics <- metrics |>
     select(all_of(keep)) |>
     round(3)
 kable(metrics, format = "simple")
+write.csv(metrics, "data622_hw2_metrics.csv", fileEncoding = "UTF-8")
 
 ```
 

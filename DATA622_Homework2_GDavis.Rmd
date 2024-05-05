@@ -369,7 +369,7 @@ p4 <- cm |>
     scale_fill_gradient(low = "white", high = pal[4]) +
     scale_x_discrete(position = "top") +
     facet_wrap(Model ~ ., ncol = 3, strip.position = "bottom") +
-    labs(title = "Confusion Matrices for All Models") +
+    labs(title = "Confusion Matrices for Tree Models") +
     theme(axis.line.x = element_blank(),
           axis.line.y = element_blank(),
           axis.text.y = element_text(angle = 90, hjust = 0.5),
@@ -377,7 +377,7 @@ p4 <- cm |>
           legend.position = "bottom",
           strip.placement = "outside")
 p4
-ggsave("data622_hw2_p4.png", p4)
+saveRDS(p4, "data622_hw2_p4.rds")
 
 ```
 
